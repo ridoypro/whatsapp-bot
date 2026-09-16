@@ -1,6 +1,5 @@
 const { default: makeWASocket, 
-        useMultiFileAuthState,
-        makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
+        useMultiFileAuthState } = require('@whiskeysockets/baileys')
 const pino = require('pino')
 
 async function startBot() {
@@ -12,15 +11,34 @@ async function startBot() {
     printQRInTerminal: false
   })
 
-  if (!sock.authState.creds.registered) {
-    const number = process.env.PHONE_NUMBER
-    const code = await sock.requestPairingCode(number)
-    console.log('তোমার Pairing Code: ' + code)
-  }
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+    
+    if (connection === 'connecting') {
+      console.log('Connecting...')
+      
+      // Connection এর জন্য একটু অপেক্ষা করো
+      await new Promise(r => setTimeout(r, 3000))
+      
+      if (!sock.authState.creds.registered) {
+        try {
+          const number = process.env.PHONE_NUMBER
+          const code = await sock.requestPairingCode(number)
+          console.log('============================')
+          console.log('তোমার Pairing Code: ' + code)
+          console.log('============================')
+        } catch(e) {
+          console.log('Code error:', e.message)
+        }
+      }
+    }
 
-  sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'open') {
       console.log('WhatsApp Connected! ✅')
+    }
+
+    if (connection === 'close') {
+      console.log('Disconnected! Reconnecting...')
+      startBot()
     }
   })
 
