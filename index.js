@@ -1,22 +1,24 @@
 const { default: makeWASocket, 
-        useMultiFileAuthState, 
-        DisconnectReason } = require('@whiskeysockets/baileys')
+        useMultiFileAuthState,
+        makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
 const pino = require('pino')
-const qrcode = require('qrcode-terminal')
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth')
   
   const sock = makeWASocket({
     auth: state,
-    logger: pino({ level: 'silent' })
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false
   })
 
-  sock.ev.on('connection.update', ({ connection, qr }) => {
-    if (qr) {
-      qrcode.generate(qr, { small: true })
-      console.log('QR Code উপরে দেখো, Phone দিয়ে Scan করো!')
-    }
+  if (!sock.authState.creds.registered) {
+    const number = process.env.PHONE_NUMBER
+    const code = await sock.requestPairingCode(number)
+    console.log('তোমার Pairing Code: ' + code)
+  }
+
+  sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'open') {
       console.log('WhatsApp Connected! ✅')
     }
@@ -32,24 +34,13 @@ async function startBot() {
                  msg.message.extendedTextMessage?.text || ''
     const from = msg.key.remoteJid
 
-    console.log('Message আসছে:', text)
-
-    // Auto Reply Rules 👇
     if (text.toLowerCase() === 'হ্যালো') {
       await sock.sendMessage(from, { 
-        text: 'হ্যালো! আমি একটি Bot 🤖 কীভাবে সাহায্য করবো?' 
+        text: 'হ্যালো! আমি Bot 🤖' 
       })
-    }
-
-    else if (text.toLowerCase() === 'price') {
+    } else {
       await sock.sendMessage(from, { 
-        text: 'আমাদের Price List:\n- Product 1: ৳500\n- Product 2: ৳1000' 
-      })
-    }
-
-    else {
-      await sock.sendMessage(from, { 
-        text: 'আপনার message পেয়েছি! শীঘ্রই reply করা হবে ✅' 
+        text: 'Message পেয়েছি ✅' 
       })
     }
   })
