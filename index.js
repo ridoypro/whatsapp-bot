@@ -1,4 +1,4 @@
-const { default: makeWASocket, 
+const { default: makeWASocket,
         useMultiFileAuthState,
         fetchLatestBaileysVersion,
         DisconnectReason } = require('@whiskeysockets/baileys')
@@ -52,7 +52,8 @@ async function sendToTelegram(text) {
 const accounts = {}
 
 async function createAccount(number) {
-  if (accounts[number]) {
+  // reconnecting হলে allow করো, নইলে block করো
+  if (accounts[number] && accounts[number].status !== 'reconnecting') {
     return { error: 'Already exists' }
   }
 
@@ -75,19 +76,31 @@ async function createAccount(number) {
     getMessage: async () => ({ conversation: '' })
   })
 
-  accounts[number] = {
-    sock,
-    status: 'connecting',
-    pairingCode: null,
-    chats: [],
-    contacts: [],
-    messages: {}
+  // নতুন account হলে create করো, reconnect হলে শুধু sock update করো
+  if (!accounts[number]) {
+    accounts[number] = {
+      sock,
+      status: 'connecting',
+      pairingCode: null,
+      chats: [],
+      contacts: [],
+      messages: {}
+    }
+  } else {
+    accounts[number].sock = sock
+    accounts[number].status = 'connecting'
+    accounts[number].pairingCode = null
   }
 
+  let pairingRequested = false
+
   sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+
     if (connection === 'connecting') {
-      await new Promise(r => setTimeout(r, 3000))
-      if (!sock.authState.creds.registered) {
+      console.log(`[${number}] Connecting...`)
+      if (!sock.authState.creds.registered && !pairingRequested) {
+        pairingRequested = true
+        await new Promise(r => setTimeout(r, 3000))
         try {
           const code = await sock.requestPairingCode(number)
           accounts[number].pairingCode = code
@@ -99,6 +112,7 @@ async function createAccount(number) {
           )
         } catch(e) {
           console.log(`[${number}] Code Error:`, e.message)
+          pairingRequested = false
         }
       }
     }
@@ -106,6 +120,7 @@ async function createAccount(number) {
     if (connection === 'open') {
       accounts[number].status = 'connected'
       accounts[number].pairingCode = null
+      pairingRequested = false
       console.log(`[${number}] Connected ✅`)
       await sendToTelegram(
         `✅ <b>WhatsApp Connected!</b>\n` +
@@ -114,13 +129,13 @@ async function createAccount(number) {
     }
 
     if (connection === 'close') {
-      accounts[number].status = 'disconnected'
       const code = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = code !== DisconnectReason.loggedOut
-      
+
       if (shouldReconnect) {
         console.log(`[${number}] Reconnecting...`)
-        delete accounts[number]
+        accounts[number].status = 'reconnecting'
+        pairingRequested = false
         setTimeout(() => createAccount(number), 5000)
       } else {
         delete accounts[number]
@@ -147,15 +162,15 @@ async function createAccount(number) {
 
   sock.ev.on('chats.upsert', (chats) => {
     chats.forEach(c => {
-      const existing = accounts[number].chats.findIndex(x => x.id === c.id)
+      const idx = accounts[number].chats.findIndex(x => x.id === c.id)
       const chat = {
         id: c.id,
         name: c.name || c.id,
         unreadCount: c.unreadCount || 0,
         timestamp: c.conversationTimestamp
       }
-      if (existing >= 0) {
-        accounts[number].chats[existing] = chat
+      if (idx >= 0) {
+        accounts[number].chats[idx] = chat
       } else {
         accounts[number].chats.push(chat)
       }
@@ -172,13 +187,13 @@ async function createAccount(number) {
 
   sock.ev.on('contacts.upsert', (contacts) => {
     contacts.forEach(c => {
-      const existing = accounts[number].contacts.findIndex(x => x.id === c.id)
+      const idx = accounts[number].contacts.findIndex(x => x.id === c.id)
       const contact = {
         id: c.id,
         name: c.name || c.notify || c.id.split('@')[0]
       }
-      if (existing >= 0) {
-        accounts[number].contacts[existing] = contact
+      if (idx >= 0) {
+        accounts[number].contacts[idx] = contact
       } else {
         accounts[number].contacts.push(contact)
       }
@@ -195,7 +210,7 @@ async function createAccount(number) {
         accounts[number].messages[chatId] = []
       }
 
-      const text = msg.message?.conversation || 
+      const text = msg.message?.conversation ||
                    msg.message?.extendedTextMessage?.text ||
                    msg.message?.imageMessage?.caption ||
                    '[Media/Other]'
@@ -230,7 +245,7 @@ async function createAccount(number) {
   return { success: true, message: 'Account creating, check pairing code' }
 }
 
-// ✅ Auto Load
+// ✅ Auto Load on Startup
 async function autoLoad() {
   if (!fs.existsSync('./auth')) return
   const numbers = fs.readdirSync('./auth')
@@ -249,7 +264,7 @@ async function autoLoad() {
 
 // 🏠 Home
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     message: 'WhatsApp API Running ✅',
     totalAccounts: Object.keys(accounts).length,
     telegramConfigured: !!telegramConfig.token
@@ -308,9 +323,7 @@ app.delete('/account/remove/:number', (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  try {
-    accounts[number].sock.logout()
-  } catch(e) {}
+  try { accounts[number].sock.logout() } catch(e) {}
   delete accounts[number]
   const authDir = `./auth/${number}`
   if (fs.existsSync(authDir)) {
@@ -351,9 +364,9 @@ app.get('/chats/:number', (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  res.json({ 
+  res.json({
     total: accounts[number].chats.length,
-    chats: accounts[number].chats 
+    chats: accounts[number].chats
   })
 })
 
@@ -439,9 +452,9 @@ app.get('/contacts/:number', (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  res.json({ 
+  res.json({
     total: accounts[number].contacts.length,
-    contacts: accounts[number].contacts 
+    contacts: accounts[number].contacts
   })
 })
 
