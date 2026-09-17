@@ -87,6 +87,7 @@ async function createAccount(number) {
         !== DisconnectReason.loggedOut
       if (shouldReconnect) {
         console.log(`[${number}] Reconnecting...`)
+        delete accounts[number]
         setTimeout(() => createAccount(number), 5000)
       } else {
         delete accounts[number]
@@ -97,7 +98,6 @@ async function createAccount(number) {
 
   sock.ev.on('creds.update', saveCreds)
 
-  // ✅ Messages Store
   sock.ev.on('messages.upsert', ({ messages }) => {
     messages.forEach(msg => {
       const chatId = msg.key.remoteJid
@@ -115,7 +115,6 @@ async function createAccount(number) {
     })
   })
 
-  // ✅ Chats Store
   sock.ev.on('chats.set', ({ chats }) => {
     accounts[number].chats = chats.map(c => ({
       id: c.id,
@@ -125,7 +124,6 @@ async function createAccount(number) {
     }))
   })
 
-  // ✅ Contacts Store
   sock.ev.on('contacts.set', ({ contacts }) => {
     accounts[number].contacts = contacts.map(c => ({
       id: c.id,
@@ -134,6 +132,22 @@ async function createAccount(number) {
   })
 
   return { success: true, message: 'Account creating, check pairing code' }
+}
+
+// ✅ Auto-load existing accounts on startup
+async function autoLoad() {
+  if (!fs.existsSync('./auth')) return
+  
+  const numbers = fs.readdirSync('./auth')
+  if (numbers.length === 0) return
+  
+  console.log(`Auto-loading ${numbers.length} accounts...`)
+  
+  for (const number of numbers) {
+    console.log(`Loading: ${number}`)
+    await createAccount(number)
+    await new Promise(r => setTimeout(r, 2000))
+  }
 }
 
 // =============================
@@ -152,7 +166,6 @@ app.get('/', (req, res) => {
 app.post('/account/add', async (req, res) => {
   const { number } = req.body
   if (!number) return res.status(400).json({ error: 'Number required' })
-  
   const result = await createAccount(number)
   res.json(result)
 })
@@ -163,15 +176,12 @@ app.delete('/account/remove/:number', (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   accounts[number].sock.logout()
   delete accounts[number]
-  
   const authDir = `./auth/${number}`
   if (fs.existsSync(authDir)) {
     fs.rmSync(authDir, { recursive: true })
   }
-  
   res.json({ success: true, message: `${number} removed` })
 })
 
@@ -231,7 +241,6 @@ app.post('/send', async (req, res) => {
   if (accounts[number].status !== 'connected') {
     return res.status(400).json({ error: 'Account not connected' })
   }
-  
   try {
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
     await accounts[number].sock.sendMessage(jid, { text: message })
@@ -247,7 +256,6 @@ app.delete('/message/delete', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[number].sock.sendMessage(jid, {
@@ -269,7 +277,6 @@ app.post('/message/read', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[number].sock.readMessages([{
@@ -288,7 +295,6 @@ app.post('/chat/archive', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[number].sock.chatModify({ archive: true }, jid)
@@ -313,7 +319,6 @@ app.post('/contact/block', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const jid = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`
     await accounts[number].sock.updateBlockStatus(jid, 'block')
@@ -329,7 +334,6 @@ app.post('/contact/unblock', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const jid = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`
     await accounts[number].sock.updateBlockStatus(jid, 'unblock')
@@ -345,7 +349,6 @@ app.post('/typing', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[number].sock.sendPresenceUpdate(
@@ -363,7 +366,6 @@ app.get('/group/:number/:groupId', async (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  
   try {
     const metadata = await accounts[number].sock.groupMetadata(groupId)
     res.json({ group: metadata })
@@ -372,8 +374,9 @@ app.get('/group/:number/:groupId', async (req, res) => {
   }
 })
 
-// ✅ Server Start
+// ✅ Server Start + Auto Load
 const PORT = process.env.PORT || 10000
-app.listen(PORT, () => {
-  console.log(`WhatsApp API Server চালু ✅ Port: ${PORT}`)
+app.listen(PORT, async () => {
+  console.log(`Server চালু ✅ Port: ${PORT}`)
+  await autoLoad()
 })
