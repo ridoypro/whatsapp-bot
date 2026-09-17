@@ -1,7 +1,6 @@
 const { default: makeWASocket, 
         useMultiFileAuthState,
         fetchLatestBaileysVersion,
-        makeInMemoryStore,
         DisconnectReason } = require('@whiskeysockets/baileys')
 const express = require('express')
 const pino = require('pino')
@@ -10,34 +9,30 @@ const fs = require('fs')
 const app = express()
 app.use(express.json())
 
-// ✅ API Key Middleware
+// ✅ API Key
 const API_KEY = process.env.API_KEY || 'your-secret-key'
 
 function authMiddleware(req, res, next) {
   const key = req.headers['x-api-key']
   if (!key || key !== API_KEY) {
-    return res.status(401).json({ 
-      error: 'Unauthorized',
-      message: 'Invalid or missing API Key' 
-    })
+    return res.status(401).json({ error: 'Unauthorized' })
   }
   next()
 }
-
 app.use(authMiddleware)
 
-// ✅ Telegram Config (Memory তে থাকবে)
+// ✅ Telegram Config
 let telegramConfig = {
   token: process.env.TELEGRAM_TOKEN || null,
   chatId: process.env.TELEGRAM_CHAT_ID || null
 }
 
-// ✅ Telegram Message Send Function
+// ✅ Telegram Send
 async function sendToTelegram(text) {
   if (!telegramConfig.token || !telegramConfig.chatId) return
   try {
     const url = `https://api.telegram.org/bot${telegramConfig.token}/sendMessage`
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -46,26 +41,14 @@ async function sendToTelegram(text) {
         parse_mode: 'HTML'
       })
     })
+    const data = await res.json()
+    if (!data.ok) console.log('Telegram Error:', data)
   } catch(e) {
     console.log('Telegram Error:', e.message)
   }
 }
 
-// ✅ Telegram Message Get Function
-async function getFromTelegram(offset = 0) {
-  if (!telegramConfig.token) return []
-  try {
-    const url = `https://api.telegram.org/bot${telegramConfig.token}/getUpdates?offset=${offset}`
-    const res = await fetch(url)
-    const data = await res.json()
-    return data.result || []
-  } catch(e) {
-    console.log('Telegram Get Error:', e.message)
-    return []
-  }
-}
-
-// ✅ Account Manager
+// ✅ Accounts Store
 const accounts = {}
 
 async function createAccount(number) {
@@ -81,10 +64,6 @@ async function createAccount(number) {
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
   const { version } = await fetchLatestBaileysVersion()
 
-  const store = makeInMemoryStore({ 
-    logger: pino({ level: 'silent' }) 
-  })
-
   const sock = makeWASocket({
     version,
     auth: state,
@@ -96,13 +75,13 @@ async function createAccount(number) {
     getMessage: async () => ({ conversation: '' })
   })
 
-  store.bind(sock.ev)
-
   accounts[number] = {
     sock,
-    store,
     status: 'connecting',
     pairingCode: null,
+    chats: [],
+    contacts: [],
+    messages: {}
   }
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
@@ -113,7 +92,11 @@ async function createAccount(number) {
           const code = await sock.requestPairingCode(number)
           accounts[number].pairingCode = code
           console.log(`[${number}] Pairing Code: ${code}`)
-          await sendToTelegram(`🔑 <b>Pairing Code</b>\nNumber: ${number}\nCode: <code>${code}</code>`)
+          await sendToTelegram(
+            `🔑 <b>Pairing Code</b>\n` +
+            `📱 Number: <code>${number}</code>\n` +
+            `🔐 Code: <code>${code}</code>`
+          )
         } catch(e) {
           console.log(`[${number}] Code Error:`, e.message)
         }
@@ -124,58 +107,130 @@ async function createAccount(number) {
       accounts[number].status = 'connected'
       accounts[number].pairingCode = null
       console.log(`[${number}] Connected ✅`)
-      await sendToTelegram(`✅ <b>WhatsApp Connected!</b>\nNumber: ${number}`)
+      await sendToTelegram(
+        `✅ <b>WhatsApp Connected!</b>\n` +
+        `📱 Number: <code>${number}</code>`
+      )
     }
 
     if (connection === 'close') {
       accounts[number].status = 'disconnected'
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode 
-        !== DisconnectReason.loggedOut
+      const code = lastDisconnect?.error?.output?.statusCode
+      const shouldReconnect = code !== DisconnectReason.loggedOut
+      
       if (shouldReconnect) {
         console.log(`[${number}] Reconnecting...`)
         delete accounts[number]
         setTimeout(() => createAccount(number), 5000)
       } else {
         delete accounts[number]
-        await sendToTelegram(`❌ <b>WhatsApp Disconnected!</b>\nNumber: ${number}`)
         console.log(`[${number}] Logged out`)
+        await sendToTelegram(
+          `❌ <b>WhatsApp Logged Out!</b>\n` +
+          `📱 Number: <code>${number}</code>`
+        )
       }
     }
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  // ✅ Messages → Telegram এ Save
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  // ✅ Chats Store
+  sock.ev.on('chats.set', ({ chats }) => {
+    accounts[number].chats = chats.map(c => ({
+      id: c.id,
+      name: c.name || c.id,
+      unreadCount: c.unreadCount || 0,
+      timestamp: c.conversationTimestamp
+    }))
+  })
+
+  sock.ev.on('chats.upsert', (chats) => {
+    chats.forEach(c => {
+      const existing = accounts[number].chats.findIndex(x => x.id === c.id)
+      const chat = {
+        id: c.id,
+        name: c.name || c.id,
+        unreadCount: c.unreadCount || 0,
+        timestamp: c.conversationTimestamp
+      }
+      if (existing >= 0) {
+        accounts[number].chats[existing] = chat
+      } else {
+        accounts[number].chats.push(chat)
+      }
+    })
+  })
+
+  // ✅ Contacts Store
+  sock.ev.on('contacts.set', ({ contacts }) => {
+    accounts[number].contacts = contacts.map(c => ({
+      id: c.id,
+      name: c.name || c.notify || c.id.split('@')[0]
+    }))
+  })
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    contacts.forEach(c => {
+      const existing = accounts[number].contacts.findIndex(x => x.id === c.id)
+      const contact = {
+        id: c.id,
+        name: c.name || c.notify || c.id.split('@')[0]
+      }
+      if (existing >= 0) {
+        accounts[number].contacts[existing] = contact
+      } else {
+        accounts[number].contacts.push(contact)
+      }
+    })
+  })
+
+  // ✅ Messages Store + Telegram Forward
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue
+      if (!msg.message) continue
 
       const chatId = msg.key.remoteJid
-      const text = msg.message?.conversation || 
-                   msg.message?.extendedTextMessage?.text || 
-                   '[Media]'
-      
-      const isGroup = chatId.endsWith('@g.us')
-      const sender = msg.pushName || chatId.split('@')[0]
-      const chatName = isGroup ? `Group: ${chatId}` : sender
+      if (!accounts[number].messages[chatId]) {
+        accounts[number].messages[chatId] = []
+      }
 
-      // Telegram এ forward
-      await sendToTelegram(
-        `📨 <b>New Message</b>\n` +
-        `📱 Account: ${number}\n` +
-        `👤 From: ${sender}\n` +
-        `💬 Chat: ${chatName}\n` +
-        `🆔 ChatID: ${chatId}\n` +
-        `📝 Message: ${text}\n` +
-        `⏰ Time: ${new Date().toLocaleString('bn-BD')}`
-      )
+      const text = msg.message?.conversation || 
+                   msg.message?.extendedTextMessage?.text ||
+                   msg.message?.imageMessage?.caption ||
+                   '[Media/Other]'
+
+      const msgData = {
+        id: msg.key.id,
+        fromMe: msg.key.fromMe,
+        sender: msg.pushName || chatId.split('@')[0],
+        text,
+        time: msg.messageTimestamp,
+        chatId
+      }
+
+      accounts[number].messages[chatId].push(msgData)
+
+      // শুধু incoming message Telegram এ পাঠাও
+      if (!msg.key.fromMe && type === 'notify') {
+        const isGroup = chatId.endsWith('@g.us')
+        await sendToTelegram(
+          `📨 <b>New Message</b>\n` +
+          `📱 Account: <code>${number}</code>\n` +
+          `👤 From: ${msgData.sender}\n` +
+          `💬 Type: ${isGroup ? 'Group' : 'Personal'}\n` +
+          `🆔 ChatID: <code>${chatId}</code>\n` +
+          `📝 Text: ${text}\n` +
+          `⏰ ${new Date(msg.messageTimestamp * 1000).toLocaleString()}`
+        )
+      }
     }
   })
 
   return { success: true, message: 'Account creating, check pairing code' }
 }
 
-// ✅ Auto-load existing accounts on startup
+// ✅ Auto Load
 async function autoLoad() {
   if (!fs.existsSync('./auth')) return
   const numbers = fs.readdirSync('./auth')
@@ -189,54 +244,10 @@ async function autoLoad() {
 }
 
 // =============================
-// ✅ TELEGRAM CONFIG ROUTES
+// ✅ ROUTES
 // =============================
 
-// Telegram Config Set
-app.post('/telegram/set', (req, res) => {
-  const { token, chatId } = req.body
-  if (!token || !chatId) {
-    return res.status(400).json({ error: 'token and chatId required' })
-  }
-  telegramConfig.token = token
-  telegramConfig.chatId = chatId
-  res.json({ 
-    success: true, 
-    message: 'Telegram config set ✅',
-    config: { token: '***hidden***', chatId }
-  })
-})
-
-// Telegram Config Remove
-app.delete('/telegram/remove', (req, res) => {
-  telegramConfig.token = null
-  telegramConfig.chatId = null
-  res.json({ success: true, message: 'Telegram config removed ✅' })
-})
-
-// Telegram Config View
-app.get('/telegram/config', (req, res) => {
-  res.json({
-    hasToken: !!telegramConfig.token,
-    chatId: telegramConfig.chatId,
-    status: telegramConfig.token ? 'configured ✅' : 'not configured ❌'
-  })
-})
-
-// Telegram Test
-app.post('/telegram/test', async (req, res) => {
-  if (!telegramConfig.token || !telegramConfig.chatId) {
-    return res.status(400).json({ error: 'Telegram not configured' })
-  }
-  await sendToTelegram('🧪 Test message from WhatsApp API! ✅')
-  res.json({ success: true, message: 'Test message sent to Telegram ✅' })
-})
-
-// =============================
-// ✅ ACCOUNT ROUTES
-// =============================
-
-// Home
+// 🏠 Home
 app.get('/', (req, res) => {
   res.json({ 
     message: 'WhatsApp API Running ✅',
@@ -245,7 +256,46 @@ app.get('/', (req, res) => {
   })
 })
 
-// Account Add
+// =============================
+// ✅ TELEGRAM ROUTES
+// =============================
+
+app.post('/telegram/set', (req, res) => {
+  const { token, chatId } = req.body
+  if (!token || !chatId) {
+    return res.status(400).json({ error: 'token and chatId required' })
+  }
+  telegramConfig.token = token
+  telegramConfig.chatId = chatId
+  res.json({ success: true, message: 'Telegram configured ✅' })
+})
+
+app.delete('/telegram/remove', (req, res) => {
+  telegramConfig.token = null
+  telegramConfig.chatId = null
+  res.json({ success: true, message: 'Telegram removed ✅' })
+})
+
+app.get('/telegram/config', (req, res) => {
+  res.json({
+    hasToken: !!telegramConfig.token,
+    chatId: telegramConfig.chatId,
+    status: telegramConfig.token ? 'Configured ✅' : 'Not configured ❌'
+  })
+})
+
+app.post('/telegram/test', async (req, res) => {
+  if (!telegramConfig.token || !telegramConfig.chatId) {
+    return res.status(400).json({ error: 'Telegram not configured' })
+  }
+  await sendToTelegram('🧪 <b>Test Message!</b>\nWhatsApp API Working ✅')
+  res.json({ success: true, message: 'Test sent ✅' })
+})
+
+// =============================
+// ✅ ACCOUNT ROUTES
+// =============================
+
 app.post('/account/add', async (req, res) => {
   const { number } = req.body
   if (!number) return res.status(400).json({ error: 'Number required' })
@@ -253,33 +303,33 @@ app.post('/account/add', async (req, res) => {
   res.json(result)
 })
 
-// Account Remove
 app.delete('/account/remove/:number', (req, res) => {
   const { number } = req.params
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  accounts[number].sock.logout()
+  try {
+    accounts[number].sock.logout()
+  } catch(e) {}
   delete accounts[number]
   const authDir = `./auth/${number}`
   if (fs.existsSync(authDir)) {
     fs.rmSync(authDir, { recursive: true })
   }
-  res.json({ success: true, message: `${number} removed` })
+  res.json({ success: true, message: `${number} removed ✅` })
 })
 
-// All Accounts
 app.get('/accounts', (req, res) => {
   const list = Object.keys(accounts).map(number => ({
     number,
     status: accounts[number].status,
     pairingCode: accounts[number].pairingCode,
-    totalChats: accounts[number].store.chats.all().length
+    totalChats: accounts[number].chats.length,
+    totalContacts: accounts[number].contacts.length
   }))
   res.json({ total: list.length, accounts: list })
 })
 
-// Account Status
 app.get('/account/status/:number', (req, res) => {
   const { number } = req.params
   if (!accounts[number]) {
@@ -293,30 +343,29 @@ app.get('/account/status/:number', (req, res) => {
 })
 
 // =============================
-// ✅ CHAT & MESSAGE ROUTES
+// ✅ CHAT ROUTES
 // =============================
 
-// Get Chats
 app.get('/chats/:number', (req, res) => {
   const { number } = req.params
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  const chats = accounts[number].store.chats.all()
-  res.json({ total: chats.length, chats })
+  res.json({ 
+    total: accounts[number].chats.length,
+    chats: accounts[number].chats 
+  })
 })
 
-// Get Messages
 app.get('/messages/:number/:chatId', (req, res) => {
   const { number, chatId } = req.params
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  const messages = accounts[number].store.messages[chatId]?.all() || []
+  const messages = accounts[number].messages[chatId] || []
   res.json({ total: messages.length, messages })
 })
 
-// Send Message
 app.post('/send', async (req, res) => {
   const { number, to, message } = req.body
   if (!number || !to || !message) {
@@ -337,7 +386,6 @@ app.post('/send', async (req, res) => {
   }
 })
 
-// Delete Message
 app.delete('/message/delete', async (req, res) => {
   const { number, chatId, messageId, fromMe } = req.body
   if (!accounts[number]) {
@@ -346,7 +394,7 @@ app.delete('/message/delete', async (req, res) => {
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[number].sock.sendMessage(jid, {
-      delete: { remoteJid: jid, fromMe: fromMe || true, id: messageId }
+      delete: { remoteJid: jid, fromMe: fromMe ?? true, id: messageId }
     })
     res.json({ success: true })
   } catch(e) {
@@ -354,7 +402,6 @@ app.delete('/message/delete', async (req, res) => {
   }
 })
 
-// Read Message
 app.post('/message/read', async (req, res) => {
   const { number, chatId, messageId } = req.body
   if (!accounts[number]) {
@@ -369,7 +416,6 @@ app.post('/message/read', async (req, res) => {
   }
 })
 
-// Archive Chat
 app.post('/chat/archive', async (req, res) => {
   const { number, chatId } = req.body
   if (!accounts[number]) {
@@ -384,17 +430,21 @@ app.post('/chat/archive', async (req, res) => {
   }
 })
 
-// Get Contacts
+// =============================
+// ✅ CONTACT ROUTES
+// =============================
+
 app.get('/contacts/:number', (req, res) => {
   const { number } = req.params
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  const contacts = Object.values(accounts[number].store.contacts)
-  res.json({ total: contacts.length, contacts })
+  res.json({ 
+    total: accounts[number].contacts.length,
+    contacts: accounts[number].contacts 
+  })
 })
 
-// Block Contact
 app.post('/contact/block', async (req, res) => {
   const { number, contactId } = req.body
   if (!accounts[number]) {
@@ -409,7 +459,6 @@ app.post('/contact/block', async (req, res) => {
   }
 })
 
-// Unblock Contact
 app.post('/contact/unblock', async (req, res) => {
   const { number, contactId } = req.body
   if (!accounts[number]) {
@@ -424,7 +473,10 @@ app.post('/contact/unblock', async (req, res) => {
   }
 })
 
-// Typing Indicator
+// =============================
+// ✅ EXTRA ROUTES
+// =============================
+
 app.post('/typing', async (req, res) => {
   const { number, chatId, isTyping } = req.body
   if (!accounts[number]) {
@@ -441,7 +493,6 @@ app.post('/typing', async (req, res) => {
   }
 })
 
-// Group Info
 app.get('/group/:number/:groupId', async (req, res) => {
   const { number, groupId } = req.params
   if (!accounts[number]) {
@@ -455,7 +506,7 @@ app.get('/group/:number/:groupId', async (req, res) => {
   }
 })
 
-// ✅ Server Start + Auto Load
+// ✅ Server Start
 const PORT = process.env.PORT || 10000
 app.listen(PORT, async () => {
   console.log(`Server চালু ✅ Port: ${PORT}`)
