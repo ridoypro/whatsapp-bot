@@ -5,12 +5,21 @@ const { default: makeWASocket,
 const express = require('express')
 const pino = require('pino')
 const fs = require('fs')
+const path = require('path')
+const QRCode = require('qrcode')
 
 const app = express()
 app.use(express.json())
 
-// ✅ API Key
+// =============================
+// ✅ CONFIG
+// =============================
+if (!process.env.API_KEY) {
+  console.warn('WARNING: API_KEY env variable not set!')
+}
 const API_KEY = process.env.API_KEY || 'your-secret-key'
+const MAX_MESSAGES_PER_CHAT = 500
+const RECONNECT_DELAY = 5000
 
 function authMiddleware(req, res, next) {
   const key = req.headers['x-api-key']
@@ -21,13 +30,21 @@ function authMiddleware(req, res, next) {
 }
 app.use(authMiddleware)
 
-// ✅ Telegram Config
+// =============================
+// ✅ TELEGRAM
+// =============================
 let telegramConfig = {
   token: process.env.TELEGRAM_TOKEN || null,
   chatId: process.env.TELEGRAM_CHAT_ID || null
 }
 
-// ✅ Telegram Send
+function escapeHtml(str = '') {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
 async function sendToTelegram(text) {
   if (!telegramConfig.token || !telegramConfig.chatId) return
   try {
@@ -38,7 +55,8 @@ async function sendToTelegram(text) {
       body: JSON.stringify({
         chat_id: telegramConfig.chatId,
         text: text,
-        parse_mode: 'HTML'
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
       })
     })
     const data = await res.json()
@@ -48,19 +66,47 @@ async function sendToTelegram(text) {
   }
 }
 
-// ✅ Accounts Store
+// =============================
+// ✅ STORE
+// =============================
 const accounts = {}
 
-async function createAccount(number) {
-  // reconnecting হলে allow করো, নইলে block করো
-  if (accounts[number] && accounts[number].status !== 'reconnecting') {
+function sanitizeNumber(number) {
+  return String(number || '').replace(/[^0-9]/g, '')
+}
+
+function extractText(msg) {
+  const m = msg.message || {}
+  return m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedButtonId ||
+    m.templateButtonReplyMessage?.selectedId ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    (m.stickerMessage ? '[Sticker]' : null) ||
+    (m.audioMessage ? '[Audio]' : null) ||
+    (m.locationMessage ? '[Location]' : null) ||
+    '[Media/Other]'
+}
+
+async function createAccount(rawNumber) {
+  const number = sanitizeNumber(rawNumber)
+  if (!number) return { error: 'Invalid number' }
+
+  const existing = accounts[number]
+  if (existing && existing.status !== 'reconnecting' && !existing.removing) {
     return { error: 'Already exists' }
   }
 
-  const authDir = `./auth/${number}`
-  if (!fs.existsSync(authDir)) {
-    fs.mkdirSync(authDir, { recursive: true })
+  // পুরনো socket বন্ধ করো
+  if (existing && existing.sock) {
+    try { existing.sock.end() } catch(e) {}
   }
+
+  const authDir = path.join('./auth', number)
+  fs.mkdirSync(authDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
   const { version } = await fetchLatestBaileysVersion()
@@ -76,50 +122,72 @@ async function createAccount(number) {
     getMessage: async () => ({ conversation: '' })
   })
 
-  // নতুন account হলে create করো, reconnect হলে শুধু sock update করো
   if (!accounts[number]) {
     accounts[number] = {
       sock,
       status: 'connecting',
+      removing: false,
       pairingCode: null,
+      qrCode: null,
       chats: [],
       contacts: [],
-      messages: {}
+      messages: {},
+      seenMsgIds: new Set(),
+      reconnectTimer: null
     }
   } else {
-    accounts[number].sock = sock
-    accounts[number].status = 'connecting'
-    accounts[number].pairingCode = null
+    Object.assign(accounts[number], {
+      sock,
+      status: 'connecting',
+      removing: false,
+      pairingCode: null,
+      qrCode: null,
+      reconnectTimer: null
+    })
   }
 
   let pairingRequested = false
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    const acc = accounts[number]
+    if (!acc) return
 
-    if (connection === 'connecting') {
-      console.log(`[${number}] Connecting...`)
+    // ✅ FIX: QR event এ pairing code request করো
+    // এটাই সঠিক সময় — এই মুহূর্তে WhatsApp server ready থাকে
+    if (qr && acc.sock === sock) {
+      // QR data URL save করো
+      try {
+        acc.qrCode = await QRCode.toDataURL(qr, { width: 300, margin: 2 })
+        console.log(`[${number}] QR Code ready`)
+      } catch(e) {
+        console.log(`[${number}] QR Error:`, e.message)
+      }
+
+      // ✅ Pairing code request করো (একবারই)
       if (!sock.authState.creds.registered && !pairingRequested) {
         pairingRequested = true
-        await new Promise(r => setTimeout(r, 3000))
         try {
           const code = await sock.requestPairingCode(number)
-          accounts[number].pairingCode = code
+          acc.pairingCode = code
           console.log(`[${number}] Pairing Code: ${code}`)
           await sendToTelegram(
             `🔑 <b>Pairing Code</b>\n` +
             `📱 Number: <code>${number}</code>\n` +
-            `🔐 Code: <code>${code}</code>`
+            `🔐 Code: <code>${code}</code>\n` +
+            `⏰ ৩ মিনিটের মধ্যে use করো!`
           )
         } catch(e) {
-          console.log(`[${number}] Code Error:`, e.message)
+          console.log(`[${number}] Pairing Error:`, e.message)
           pairingRequested = false
         }
       }
     }
 
     if (connection === 'open') {
-      accounts[number].status = 'connected'
-      accounts[number].pairingCode = null
+      if (acc.sock !== sock) return
+      acc.status = 'connected'
+      acc.pairingCode = null
+      acc.qrCode = null
       pairingRequested = false
       console.log(`[${number}] Connected ✅`)
       await sendToTelegram(
@@ -131,14 +199,22 @@ async function createAccount(number) {
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = code !== DisconnectReason.loggedOut
+      try { sock.end() } catch(e) {}
+
+      if (!acc || acc.sock !== sock || acc.removing) return
 
       if (shouldReconnect) {
-        console.log(`[${number}] Reconnecting...`)
-        accounts[number].status = 'reconnecting'
+        console.log(`[${number}] Reconnecting in ${RECONNECT_DELAY / 1000}s...`)
+        // ✅ FIX: account delete করি না, শুধু status update করি
+        acc.status = 'reconnecting'
+        acc.pairingCode = null
+        acc.qrCode = null
         pairingRequested = false
-        setTimeout(() => createAccount(number), 5000)
+        if (acc.reconnectTimer) clearTimeout(acc.reconnectTimer)
+        acc.reconnectTimer = setTimeout(() => createAccount(number), RECONNECT_DELAY)
       } else {
         delete accounts[number]
+        fs.rmSync(authDir, { recursive: true, force: true })
         console.log(`[${number}] Logged out`)
         await sendToTelegram(
           `❌ <b>WhatsApp Logged Out!</b>\n` +
@@ -152,79 +228,91 @@ async function createAccount(number) {
 
   // ✅ Chats Store
   sock.ev.on('chats.set', ({ chats }) => {
-    accounts[number].chats = chats.map(c => ({
+    const acc = accounts[number]
+    if (!acc) return
+    acc.chats = (chats || []).map(c => ({
       id: c.id,
       name: c.name || c.id,
       unreadCount: c.unreadCount || 0,
-      timestamp: c.conversationTimestamp
+      timestamp: Number(c.conversationTimestamp) || 0
     }))
   })
 
   sock.ev.on('chats.upsert', (chats) => {
-    chats.forEach(c => {
-      const idx = accounts[number].chats.findIndex(x => x.id === c.id)
+    const acc = accounts[number]
+    if (!acc) return
+    ;(chats || []).forEach(c => {
+      const idx = acc.chats.findIndex(x => x.id === c.id)
       const chat = {
         id: c.id,
         name: c.name || c.id,
         unreadCount: c.unreadCount || 0,
-        timestamp: c.conversationTimestamp
+        timestamp: Number(c.conversationTimestamp) || 0
       }
-      if (idx >= 0) {
-        accounts[number].chats[idx] = chat
-      } else {
-        accounts[number].chats.push(chat)
-      }
+      if (idx >= 0) acc.chats[idx] = chat
+      else acc.chats.push(chat)
     })
   })
 
   // ✅ Contacts Store
   sock.ev.on('contacts.set', ({ contacts }) => {
-    accounts[number].contacts = contacts.map(c => ({
+    const acc = accounts[number]
+    if (!acc) return
+    acc.contacts = (contacts || []).map(c => ({
       id: c.id,
       name: c.name || c.notify || c.id.split('@')[0]
     }))
   })
 
   sock.ev.on('contacts.upsert', (contacts) => {
-    contacts.forEach(c => {
-      const idx = accounts[number].contacts.findIndex(x => x.id === c.id)
+    const acc = accounts[number]
+    if (!acc) return
+    ;(contacts || []).forEach(c => {
+      const idx = acc.contacts.findIndex(x => x.id === c.id)
       const contact = {
         id: c.id,
         name: c.name || c.notify || c.id.split('@')[0]
       }
-      if (idx >= 0) {
-        accounts[number].contacts[idx] = contact
-      } else {
-        accounts[number].contacts.push(contact)
-      }
+      if (idx >= 0) acc.contacts[idx] = contact
+      else acc.contacts.push(contact)
     })
   })
 
   // ✅ Messages Store + Telegram Forward
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    for (const msg of messages) {
-      if (!msg.message) continue
+    const acc = accounts[number]
+    if (!acc) return
 
-      const chatId = msg.key.remoteJid
-      if (!accounts[number].messages[chatId]) {
-        accounts[number].messages[chatId] = []
+    for (const msg of (messages || [])) {
+      if (!msg.message || !msg.key) continue
+
+      // ✅ Duplicate skip
+      if (acc.seenMsgIds.has(msg.key.id)) continue
+      acc.seenMsgIds.add(msg.key.id)
+      if (acc.seenMsgIds.size > 2000) {
+        acc.seenMsgIds = new Set([...acc.seenMsgIds].slice(-1000))
       }
 
-      const text = msg.message?.conversation ||
-                   msg.message?.extendedTextMessage?.text ||
-                   msg.message?.imageMessage?.caption ||
-                   '[Media/Other]'
+      const chatId = msg.key.remoteJid
+      const text = extractText(msg)
+      const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)
 
       const msgData = {
         id: msg.key.id,
-        fromMe: msg.key.fromMe,
+        fromMe: !!msg.key.fromMe,
         sender: msg.pushName || chatId.split('@')[0],
         text,
-        time: msg.messageTimestamp,
+        time: ts,
         chatId
       }
 
-      accounts[number].messages[chatId].push(msgData)
+      const arr = acc.messages[chatId] || (acc.messages[chatId] = [])
+      arr.push(msgData)
+
+      // ✅ Memory limit
+      if (arr.length > MAX_MESSAGES_PER_CHAT) {
+        arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT)
+      }
 
       // শুধু incoming message Telegram এ পাঠাও
       if (!msg.key.fromMe && type === 'notify') {
@@ -232,26 +320,29 @@ async function createAccount(number) {
         await sendToTelegram(
           `📨 <b>New Message</b>\n` +
           `📱 Account: <code>${number}</code>\n` +
-          `👤 From: ${msgData.sender}\n` +
+          `👤 From: ${escapeHtml(msgData.sender)}\n` +
           `💬 Type: ${isGroup ? 'Group' : 'Personal'}\n` +
           `🆔 ChatID: <code>${chatId}</code>\n` +
-          `📝 Text: ${text}\n` +
-          `⏰ ${new Date(msg.messageTimestamp * 1000).toLocaleString()}`
+          `📝 Text: ${escapeHtml(text)}\n` +
+          `⏰ ${new Date(ts * 1000).toLocaleString()}`
         )
       }
     }
   })
 
-  return { success: true, message: 'Account creating, check pairing code' }
+  return { success: true, message: 'Account creating — GET /account/status/:number for pairing code' }
 }
 
 // ✅ Auto Load on Startup
 async function autoLoad() {
-  if (!fs.existsSync('./auth')) return
-  const numbers = fs.readdirSync('./auth')
-  if (numbers.length === 0) return
-  console.log(`Auto-loading ${numbers.length} accounts...`)
-  for (const number of numbers) {
+  const authRoot = './auth'
+  if (!fs.existsSync(authRoot)) return
+  const entries = fs.readdirSync(authRoot).filter(e => {
+    try { return fs.statSync(path.join(authRoot, e)).isDirectory() } catch { return false }
+  })
+  if (entries.length === 0) return
+  console.log(`Auto-loading ${entries.length} accounts...`)
+  for (const number of entries) {
     console.log(`Loading: ${number}`)
     await createAccount(number)
     await new Promise(r => setTimeout(r, 2000))
@@ -262,7 +353,6 @@ async function autoLoad() {
 // ✅ ROUTES
 // =============================
 
-// 🏠 Home
 app.get('/', (req, res) => {
   res.json({
     message: 'WhatsApp API Running ✅',
@@ -318,17 +408,20 @@ app.post('/account/add', async (req, res) => {
   res.json(result)
 })
 
-app.delete('/account/remove/:number', (req, res) => {
-  const { number } = req.params
-  if (!accounts[number]) {
-    return res.status(404).json({ error: 'Account not found' })
-  }
-  try { accounts[number].sock.logout() } catch(e) {}
+app.delete('/account/remove/:number', async (req, res) => {
+  const number = sanitizeNumber(req.params.number)
+  const acc = accounts[number]
+  if (!acc) return res.status(404).json({ error: 'Account not found' })
+
+  acc.removing = true
+  if (acc.reconnectTimer) clearTimeout(acc.reconnectTimer)
+  try { await acc.sock.logout() } catch(e) {}
+  await new Promise(r => setTimeout(r, 1000))
+  try { acc.sock.end() } catch(e) {}
   delete accounts[number]
-  const authDir = `./auth/${number}`
-  if (fs.existsSync(authDir)) {
-    fs.rmSync(authDir, { recursive: true })
-  }
+
+  const authDir = path.join('./auth', number)
+  if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true })
   res.json({ success: true, message: `${number} removed ✅` })
 })
 
@@ -336,7 +429,8 @@ app.get('/accounts', (req, res) => {
   const list = Object.keys(accounts).map(number => ({
     number,
     status: accounts[number].status,
-    pairingCode: accounts[number].pairingCode,
+    hasPairingCode: !!accounts[number].pairingCode,
+    hasQr: !!accounts[number].qrCode,
     totalChats: accounts[number].chats.length,
     totalContacts: accounts[number].contacts.length
   }))
@@ -344,14 +438,15 @@ app.get('/accounts', (req, res) => {
 })
 
 app.get('/account/status/:number', (req, res) => {
-  const { number } = req.params
+  const number = sanitizeNumber(req.params.number)
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   res.json({
     number,
     status: accounts[number].status,
-    pairingCode: accounts[number].pairingCode
+    pairingCode: accounts[number].pairingCode,
+    qrCode: accounts[number].qrCode
   })
 })
 
@@ -360,7 +455,7 @@ app.get('/account/status/:number', (req, res) => {
 // =============================
 
 app.get('/chats/:number', (req, res) => {
-  const { number } = req.params
+  const number = sanitizeNumber(req.params.number)
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
@@ -371,7 +466,8 @@ app.get('/chats/:number', (req, res) => {
 })
 
 app.get('/messages/:number/:chatId', (req, res) => {
-  const { number, chatId } = req.params
+  const number = sanitizeNumber(req.params.number)
+  const { chatId } = req.params
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
@@ -381,18 +477,19 @@ app.get('/messages/:number/:chatId', (req, res) => {
 
 app.post('/send', async (req, res) => {
   const { number, to, message } = req.body
-  if (!number || !to || !message) {
+  const num = sanitizeNumber(number)
+  if (!num || !to || !message) {
     return res.status(400).json({ error: 'number, to, message required' })
   }
-  if (!accounts[number]) {
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  if (accounts[number].status !== 'connected') {
+  if (accounts[num].status !== 'connected') {
     return res.status(400).json({ error: 'Account not connected' })
   }
   try {
-    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`
-    await accounts[number].sock.sendMessage(jid, { text: message })
+    const jid = to.includes('@') ? to : `${sanitizeNumber(to)}@s.whatsapp.net`
+    await accounts[num].sock.sendMessage(jid, { text: message })
     res.json({ success: true, message: 'Sent ✅' })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -401,12 +498,13 @@ app.post('/send', async (req, res) => {
 
 app.delete('/message/delete', async (req, res) => {
   const { number, chatId, messageId, fromMe } = req.body
-  if (!accounts[number]) {
+  const num = sanitizeNumber(number)
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
-    await accounts[number].sock.sendMessage(jid, {
+    await accounts[num].sock.sendMessage(jid, {
       delete: { remoteJid: jid, fromMe: fromMe ?? true, id: messageId }
     })
     res.json({ success: true })
@@ -417,12 +515,13 @@ app.delete('/message/delete', async (req, res) => {
 
 app.post('/message/read', async (req, res) => {
   const { number, chatId, messageId } = req.body
-  if (!accounts[number]) {
+  const num = sanitizeNumber(number)
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
-    await accounts[number].sock.readMessages([{ remoteJid: jid, id: messageId }])
+    await accounts[num].sock.readMessages([{ remoteJid: jid, id: messageId }])
     res.json({ success: true })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -431,12 +530,13 @@ app.post('/message/read', async (req, res) => {
 
 app.post('/chat/archive', async (req, res) => {
   const { number, chatId } = req.body
-  if (!accounts[number]) {
+  const num = sanitizeNumber(number)
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
-    await accounts[number].sock.chatModify({ archive: true }, jid)
+    await accounts[num].sock.chatModify({ archive: true, lastMessages: [] }, jid)
     res.json({ success: true })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -448,7 +548,7 @@ app.post('/chat/archive', async (req, res) => {
 // =============================
 
 app.get('/contacts/:number', (req, res) => {
-  const { number } = req.params
+  const number = sanitizeNumber(req.params.number)
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
@@ -460,12 +560,13 @@ app.get('/contacts/:number', (req, res) => {
 
 app.post('/contact/block', async (req, res) => {
   const { number, contactId } = req.body
-  if (!accounts[number]) {
+  const num = sanitizeNumber(number)
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
     const jid = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`
-    await accounts[number].sock.updateBlockStatus(jid, 'block')
+    await accounts[num].sock.updateBlockStatus(jid, 'block')
     res.json({ success: true })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -474,12 +575,13 @@ app.post('/contact/block', async (req, res) => {
 
 app.post('/contact/unblock', async (req, res) => {
   const { number, contactId } = req.body
-  if (!accounts[number]) {
+  const num = sanitizeNumber(number)
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
     const jid = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`
-    await accounts[number].sock.updateBlockStatus(jid, 'unblock')
+    await accounts[num].sock.updateBlockStatus(jid, 'unblock')
     res.json({ success: true })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -492,12 +594,13 @@ app.post('/contact/unblock', async (req, res) => {
 
 app.post('/typing', async (req, res) => {
   const { number, chatId, isTyping } = req.body
-  if (!accounts[number]) {
+  const num = sanitizeNumber(number)
+  if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
     const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
-    await accounts[number].sock.sendPresenceUpdate(
+    await accounts[num].sock.sendPresenceUpdate(
       isTyping ? 'composing' : 'paused', jid
     )
     res.json({ success: true })
@@ -507,12 +610,14 @@ app.post('/typing', async (req, res) => {
 })
 
 app.get('/group/:number/:groupId', async (req, res) => {
-  const { number, groupId } = req.params
+  const number = sanitizeNumber(req.params.number)
+  const { groupId } = req.params
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const metadata = await accounts[number].sock.groupMetadata(groupId)
+    const gid = groupId.includes('@') ? groupId : `${groupId}@g.us`
+    const metadata = await accounts[number].sock.groupMetadata(gid)
     res.json({ group: metadata })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -522,6 +627,6 @@ app.get('/group/:number/:groupId', async (req, res) => {
 // ✅ Server Start
 const PORT = process.env.PORT || 10000
 app.listen(PORT, async () => {
-  console.log(`Server চালু ✅ Port: ${PORT}`)
+  console.log(`Server running ✅ Port: ${PORT}`)
   await autoLoad()
 })
