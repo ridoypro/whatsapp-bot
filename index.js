@@ -20,6 +20,7 @@ if (!process.env.API_KEY) {
 const API_KEY = process.env.API_KEY || 'your-secret-key'
 const MAX_MESSAGES_PER_CHAT = 500
 const RECONNECT_DELAY = 5000
+const PAIRING_REFRESH_INTERVAL = 3 * 60 * 1000 // ✅ ৩ মিনিট
 
 function authMiddleware(req, res, next) {
   const key = req.headers['x-api-key']
@@ -100,9 +101,13 @@ async function createAccount(rawNumber) {
     return { error: 'Already exists' }
   }
 
-  // পুরনো socket বন্ধ করো
-  if (existing && existing.sock) {
-    try { existing.sock.end() } catch(e) {}
+  // পুরনো socket ও interval বন্ধ করো
+  if (existing) {
+    if (existing.pairingInterval) clearInterval(existing.pairingInterval)
+    if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer)
+    if (existing.sock) {
+      try { existing.sock.end() } catch(e) {}
+    }
   }
 
   const authDir = path.join('./auth', number)
@@ -129,11 +134,12 @@ async function createAccount(rawNumber) {
       removing: false,
       pairingCode: null,
       qrCode: null,
+      pairingInterval: null,
+      reconnectTimer: null,
       chats: [],
       contacts: [],
       messages: {},
-      seenMsgIds: new Set(),
-      reconnectTimer: null
+      seenMsgIds: new Set()
     }
   } else {
     Object.assign(accounts[number], {
@@ -142,6 +148,7 @@ async function createAccount(rawNumber) {
       removing: false,
       pairingCode: null,
       qrCode: null,
+      pairingInterval: null,
       reconnectTimer: null
     })
   }
@@ -152,10 +159,8 @@ async function createAccount(rawNumber) {
     const acc = accounts[number]
     if (!acc) return
 
-    // ✅ FIX: QR event এ pairing code request করো
-    // এটাই সঠিক সময় — এই মুহূর্তে WhatsApp server ready থাকে
+    // ✅ QR Event এ Pairing Code Request
     if (qr && acc.sock === sock) {
-      // QR data URL save করো
       try {
         acc.qrCode = await QRCode.toDataURL(qr, { width: 300, margin: 2 })
         console.log(`[${number}] QR Code ready`)
@@ -163,9 +168,10 @@ async function createAccount(rawNumber) {
         console.log(`[${number}] QR Error:`, e.message)
       }
 
-      // ✅ Pairing code request করো (একবারই)
       if (!sock.authState.creds.registered && !pairingRequested) {
         pairingRequested = true
+
+        // ✅ প্রথম Pairing Code
         try {
           const code = await sock.requestPairingCode(number)
           acc.pairingCode = code
@@ -174,17 +180,46 @@ async function createAccount(rawNumber) {
             `🔑 <b>Pairing Code</b>\n` +
             `📱 Number: <code>${number}</code>\n` +
             `🔐 Code: <code>${code}</code>\n` +
-            `⏰ ৩ মিনিটের মধ্যে use করো!`
+            `⏰ ৩ মিনিট পর নতুন code আসবে!`
           )
         } catch(e) {
           console.log(`[${number}] Pairing Error:`, e.message)
           pairingRequested = false
+          return
         }
+
+        // ✅ প্রতি ৩ মিনিটে নতুন Pairing Code
+        if (acc.pairingInterval) clearInterval(acc.pairingInterval)
+        acc.pairingInterval = setInterval(async () => {
+          const cur = accounts[number]
+          if (!cur || cur.sock !== sock || cur.status === 'connected' || cur.removing) {
+            clearInterval(cur?.pairingInterval)
+            return
+          }
+          try {
+            const newCode = await sock.requestPairingCode(number)
+            cur.pairingCode = newCode
+            console.log(`[${number}] New Pairing Code: ${newCode}`)
+            await sendToTelegram(
+              `🔄 <b>New Pairing Code</b>\n` +
+              `📱 Number: <code>${number}</code>\n` +
+              `🔐 Code: <code>${newCode}</code>\n` +
+              `⏰ ৩ মিনিট পর আবার নতুন code আসবে!`
+            )
+          } catch(e) {
+            console.log(`[${number}] Refresh Error:`, e.message)
+          }
+        }, PAIRING_REFRESH_INTERVAL)
       }
     }
 
     if (connection === 'open') {
       if (acc.sock !== sock) return
+      // ✅ Connected হলে interval বন্ধ করো
+      if (acc.pairingInterval) {
+        clearInterval(acc.pairingInterval)
+        acc.pairingInterval = null
+      }
       acc.status = 'connected'
       acc.pairingCode = null
       acc.qrCode = null
@@ -199,13 +234,19 @@ async function createAccount(rawNumber) {
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = code !== DisconnectReason.loggedOut
+
+      // ✅ Interval বন্ধ করো
+      if (acc.pairingInterval) {
+        clearInterval(acc.pairingInterval)
+        acc.pairingInterval = null
+      }
+
       try { sock.end() } catch(e) {}
 
       if (!acc || acc.sock !== sock || acc.removing) return
 
       if (shouldReconnect) {
         console.log(`[${number}] Reconnecting in ${RECONNECT_DELAY / 1000}s...`)
-        // ✅ FIX: account delete করি না, শুধু status update করি
         acc.status = 'reconnecting'
         acc.pairingCode = null
         acc.qrCode = null
@@ -286,7 +327,6 @@ async function createAccount(rawNumber) {
     for (const msg of (messages || [])) {
       if (!msg.message || !msg.key) continue
 
-      // ✅ Duplicate skip
       if (acc.seenMsgIds.has(msg.key.id)) continue
       acc.seenMsgIds.add(msg.key.id)
       if (acc.seenMsgIds.size > 2000) {
@@ -309,12 +349,10 @@ async function createAccount(rawNumber) {
       const arr = acc.messages[chatId] || (acc.messages[chatId] = [])
       arr.push(msgData)
 
-      // ✅ Memory limit
       if (arr.length > MAX_MESSAGES_PER_CHAT) {
         arr.splice(0, arr.length - MAX_MESSAGES_PER_CHAT)
       }
 
-      // শুধু incoming message Telegram এ পাঠাও
       if (!msg.key.fromMe && type === 'notify') {
         const isGroup = chatId.endsWith('@g.us')
         await sendToTelegram(
@@ -414,6 +452,7 @@ app.delete('/account/remove/:number', async (req, res) => {
   if (!acc) return res.status(404).json({ error: 'Account not found' })
 
   acc.removing = true
+  if (acc.pairingInterval) clearInterval(acc.pairingInterval)
   if (acc.reconnectTimer) clearTimeout(acc.reconnectTimer)
   try { await acc.sock.logout() } catch(e) {}
   await new Promise(r => setTimeout(r, 1000))
