@@ -22,8 +22,14 @@ const MAX_MESSAGES_PER_CHAT = 500
 const RECONNECT_DELAY = 5000
 const PAIRING_REFRESH_INTERVAL = 3 * 60 * 1000 // ✅ ৩ মিনিট
 
+// Health checks must stay reachable without a key (hosts, load balancers, first run).
+const PUBLIC_GET_PATHS = new Set(['/', '/health'])
+
 function authMiddleware(req, res, next) {
-  const key = req.headers['x-api-key']
+  if (req.method === 'GET' && PUBLIC_GET_PATHS.has(req.path)) return next()
+  const authHeader = req.headers.authorization || ''
+  const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  const key = req.headers['x-api-key'] || bearer
   if (!key || key !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
@@ -76,6 +82,32 @@ function sanitizeNumber(number) {
   return String(number || '').replace(/[^0-9]/g, '')
 }
 
+// Build a full JID from a bare id or an already-qualified JID. Null when missing.
+function toJid(value, domain = 's.whatsapp.net') {
+  if (value === undefined || value === null) return null
+  const v = String(value).trim()
+  if (!v) return null
+  return v.includes('@') ? v : `${v}@${domain}`
+}
+
+// Messages are stored by full JID, but callers often query a bare (sometimes
+// URL-encoded) id. Try each likely form before returning empty.
+function findMessages(acc, chatId) {
+  if (!chatId) return []
+  const candidates = [chatId]
+  try {
+    const decoded = decodeURIComponent(chatId)
+    if (!candidates.includes(decoded)) candidates.push(decoded)
+  } catch {}
+  if (!chatId.includes('@')) {
+    candidates.push(`${chatId}@s.whatsapp.net`, `${chatId}@g.us`, `${chatId}@lid`)
+  }
+  for (const key of candidates) {
+    if (acc.messages[key]) return acc.messages[key]
+  }
+  return []
+}
+
 function extractText(msg) {
   const m = msg.message || {}
   return m.conversation ||
@@ -94,7 +126,7 @@ function extractText(msg) {
 
 async function createAccount(rawNumber) {
   const number = sanitizeNumber(rawNumber)
-  if (!number) return { error: 'Invalid number' }
+  if (!number || number.length < 7) return { error: 'Invalid number' }
 
   const existing = accounts[number]
   if (existing && existing.status !== 'reconnecting' && !existing.removing) {
@@ -399,12 +431,16 @@ app.get('/', (req, res) => {
   })
 })
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' })
+})
+
 // =============================
 // ✅ TELEGRAM ROUTES
 // =============================
 
 app.post('/telegram/set', (req, res) => {
-  const { token, chatId } = req.body
+  const { token, chatId } = req.body || {}
   if (!token || !chatId) {
     return res.status(400).json({ error: 'token and chatId required' })
   }
@@ -440,10 +476,19 @@ app.post('/telegram/test', async (req, res) => {
 // =============================
 
 app.post('/account/add', async (req, res) => {
-  const { number } = req.body
-  if (!number) return res.status(400).json({ error: 'Number required' })
-  const result = await createAccount(number)
-  res.json(result)
+  const { number } = req.body || {}
+  const num = sanitizeNumber(number)
+  if (!num || num.length < 7) {
+    return res.status(400).json({ error: 'Valid number required (min 7 digits)' })
+  }
+  try {
+    const result = await createAccount(number)
+    if (result && result.error === 'Already exists') return res.status(409).json(result)
+    if (result && result.error) return res.status(400).json(result)
+    res.status(202).json(result)
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
 })
 
 app.delete('/account/remove/:number', async (req, res) => {
@@ -510,14 +555,16 @@ app.get('/messages/:number/:chatId', (req, res) => {
   if (!accounts[number]) {
     return res.status(404).json({ error: 'Account not found' })
   }
-  const messages = accounts[number].messages[chatId] || []
+  const all = findMessages(accounts[number], chatId)
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || all.length, 1), 500)
+  const messages = all.slice(-limit)
   res.json({ total: messages.length, messages })
 })
 
 app.post('/send', async (req, res) => {
-  const { number, to, message } = req.body
+  const { number, to, message } = req.body || {}
   const num = sanitizeNumber(number)
-  if (!num || !to || !message) {
+  if (!num || to === undefined || to === null || String(to).trim() === '' || !message) {
     return res.status(400).json({ error: 'number, to, message required' })
   }
   if (!accounts[num]) {
@@ -527,8 +574,9 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'Account not connected' })
   }
   try {
-    const jid = to.includes('@') ? to : `${sanitizeNumber(to)}@s.whatsapp.net`
-    await accounts[num].sock.sendMessage(jid, { text: message })
+    const toStr = String(to).trim()
+    const jid = toStr.includes('@') ? toStr : `${sanitizeNumber(toStr)}@s.whatsapp.net`
+    await accounts[num].sock.sendMessage(jid, { text: String(message) })
     res.json({ success: true, message: 'Sent ✅' })
   } catch(e) {
     res.status(500).json({ error: e.message })
@@ -536,13 +584,22 @@ app.post('/send', async (req, res) => {
 })
 
 app.delete('/message/delete', async (req, res) => {
-  const { number, chatId, messageId, fromMe } = req.body
+  const { number, chatId, messageId, fromMe } = req.body || {}
   const num = sanitizeNumber(number)
+  const jid = toJid(chatId)
+  if (!num) {
+    return res.status(400).json({ error: 'number required' })
+  }
+  if (!jid) {
+    return res.status(400).json({ error: 'chatId required' })
+  }
+  if (!messageId) {
+    return res.status(400).json({ error: 'messageId required' })
+  }
   if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[num].sock.sendMessage(jid, {
       delete: { remoteJid: jid, fromMe: fromMe ?? true, id: messageId }
     })
@@ -553,13 +610,22 @@ app.delete('/message/delete', async (req, res) => {
 })
 
 app.post('/message/read', async (req, res) => {
-  const { number, chatId, messageId } = req.body
+  const { number, chatId, messageId } = req.body || {}
   const num = sanitizeNumber(number)
+  const jid = toJid(chatId)
+  if (!num) {
+    return res.status(400).json({ error: 'number required' })
+  }
+  if (!jid) {
+    return res.status(400).json({ error: 'chatId required' })
+  }
+  if (!messageId) {
+    return res.status(400).json({ error: 'messageId required' })
+  }
   if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[num].sock.readMessages([{ remoteJid: jid, id: messageId }])
     res.json({ success: true })
   } catch(e) {
@@ -568,13 +634,19 @@ app.post('/message/read', async (req, res) => {
 })
 
 app.post('/chat/archive', async (req, res) => {
-  const { number, chatId } = req.body
+  const { number, chatId } = req.body || {}
   const num = sanitizeNumber(number)
+  const jid = toJid(chatId)
+  if (!num) {
+    return res.status(400).json({ error: 'number required' })
+  }
+  if (!jid) {
+    return res.status(400).json({ error: 'chatId required' })
+  }
   if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[num].sock.chatModify({ archive: true, lastMessages: [] }, jid)
     res.json({ success: true })
   } catch(e) {
@@ -598,13 +670,19 @@ app.get('/contacts/:number', (req, res) => {
 })
 
 app.post('/contact/block', async (req, res) => {
-  const { number, contactId } = req.body
+  const { number, contactId } = req.body || {}
   const num = sanitizeNumber(number)
+  const jid = toJid(contactId)
+  if (!num) {
+    return res.status(400).json({ error: 'number required' })
+  }
+  if (!jid) {
+    return res.status(400).json({ error: 'contactId required' })
+  }
   if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const jid = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`
     await accounts[num].sock.updateBlockStatus(jid, 'block')
     res.json({ success: true })
   } catch(e) {
@@ -613,13 +691,19 @@ app.post('/contact/block', async (req, res) => {
 })
 
 app.post('/contact/unblock', async (req, res) => {
-  const { number, contactId } = req.body
+  const { number, contactId } = req.body || {}
   const num = sanitizeNumber(number)
+  const jid = toJid(contactId)
+  if (!num) {
+    return res.status(400).json({ error: 'number required' })
+  }
+  if (!jid) {
+    return res.status(400).json({ error: 'contactId required' })
+  }
   if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const jid = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`
     await accounts[num].sock.updateBlockStatus(jid, 'unblock')
     res.json({ success: true })
   } catch(e) {
@@ -632,13 +716,19 @@ app.post('/contact/unblock', async (req, res) => {
 // =============================
 
 app.post('/typing', async (req, res) => {
-  const { number, chatId, isTyping } = req.body
+  const { number, chatId, isTyping } = req.body || {}
   const num = sanitizeNumber(number)
+  const jid = toJid(chatId)
+  if (!num) {
+    return res.status(400).json({ error: 'number required' })
+  }
+  if (!jid) {
+    return res.status(400).json({ error: 'chatId required' })
+  }
   if (!accounts[num]) {
     return res.status(404).json({ error: 'Account not found' })
   }
   try {
-    const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`
     await accounts[num].sock.sendPresenceUpdate(
       isTyping ? 'composing' : 'paused', jid
     )
@@ -663,9 +753,29 @@ app.get('/group/:number/:groupId', async (req, res) => {
   }
 })
 
-// ✅ Server Start
-const PORT = process.env.PORT || 10000
-app.listen(PORT, async () => {
-  console.log(`Server running ✅ Port: ${PORT}`)
-  await autoLoad()
+// Unknown routes return JSON instead of the default HTML page.
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' })
 })
+
+// Malformed JSON (and other errors) return JSON instead of HTML.
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) {
+    return res.status(400).json({ error: 'Invalid JSON body' })
+  }
+  console.log('Request Error:', err && err.message ? err.message : err)
+  res.status(500).json({ error: 'Internal server error' })
+})
+
+// Only auto-start when run directly. Requiring the file (e.g. tests) must not bind a port.
+if (require.main === module) {
+  const PORT = process.env.PORT || 10000
+  app.listen(PORT, async () => {
+    console.log(`Server running ✅ Port: ${PORT}`)
+    await autoLoad()
+  })
+}
+
+module.exports = app
+module.exports.toJid = toJid
+module.exports.findMessages = findMessages
